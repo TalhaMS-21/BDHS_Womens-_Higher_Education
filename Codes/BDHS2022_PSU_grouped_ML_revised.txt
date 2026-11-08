@@ -1,0 +1,431 @@
+###############################################################################
+# BDHS 2022 - WOMEN'S HIGHER EDUCATION
+# PSU-GROUPED MACHINE-LEARNING PIPELINE
+# 8 classifiers | Combined, Rural, Urban | PSU-level train/test split
+# PSU-grouped CV | genuine OOF predictions | cluster-bootstrap test CIs
+###############################################################################
+
+# ---- 0. SETTINGS ------------------------------------------------------------
+if (!exists("DATA_FILE")) DATA_FILE <- "D:/Research/Women's higher education/reanalysis/output/bdhs2022_prepared_full.dta"
+if (!exists("OUTPUT_DIR")) OUTPUT_DIR <- "D:/Research/Women's higher education/reanalysis/output/ML_results_PSU_CV"
+if (!exists("QUICK")) QUICK <- FALSE
+
+SEED <- 20261024
+TRAIN_FRAC <- 0.70
+K_FOLDS <- 5
+N_BOOT <- if (QUICK) 100 else 1000
+FONT <- "sans"
+
+MODELS <- c("Logistic_Regression", "Decision_Tree", "Random_Forest", "Naive_Bayes",
+            "Neural_Network", "XGBoost", "Gradient_Boosting", "Radial_SVM")
+if (QUICK) MODELS <- c("Logistic_Regression", "Decision_Tree", "Random_Forest", "XGBoost")
+REFERENCE <- "Logistic_Regression"
+
+PRETTY <- c(Logistic_Regression="Logistic Regression", Decision_Tree="Decision Tree",
+            Random_Forest="Random Forest", Naive_Bayes="Naive Bayes", Neural_Network="ANN",
+            XGBoost="XGBoost", Gradient_Boosting="Gradient Boosting", Radial_SVM="SVM")
+PAL <- c(Logistic_Regression="#984EA3", Decision_Tree="#377EB8", Random_Forest="#A65628",
+         Naive_Bayes="#FF7F00", Neural_Network="#E41A1C", XGBoost="#17BECF",
+         Gradient_Boosting="#4DAF4A", Radial_SVM="#F781BF")
+
+GRIDS <- list(
+  Logistic_Regression = NULL,
+  Decision_Tree = expand.grid(cp=c(0.001,0.01,0.05)),
+  Random_Forest = expand.grid(mtry=c(3,6), splitrule="gini", min.node.size=c(5,20)),
+  Naive_Bayes = expand.grid(laplace=c(0,1), usekernel=FALSE, adjust=1),
+  Neural_Network = expand.grid(size=c(3,6), decay=c(0.01,0.1)),
+  XGBoost = expand.grid(nrounds=c(100,150), max_depth=c(2,3), eta=0.1,
+                        gamma=0, colsample_bytree=0.8, min_child_weight=1, subsample=0.8),
+  Gradient_Boosting = expand.grid(n.trees=c(100,150), interaction.depth=c(1,3),
+                                  shrinkage=0.1, n.minobsinnode=10),
+  Radial_SVM = expand.grid(cost=c(0.1,1,2))
+)
+
+dir.create(OUTPUT_DIR, recursive=TRUE, showWarnings=FALSE)
+set.seed(SEED)
+LOG_FILE <- file.path(OUTPUT_DIR, paste0("ML_log_",format(Sys.time(),"%Y%m%d_%H%M%S"),".txt"))
+log_con <- file(LOG_FILE, open="wt")
+sink(log_con, split=TRUE)
+cat("Started:",format(Sys.time()),"\nData:",DATA_FILE,"\n")
+
+# ---- 1. PACKAGES ------------------------------------------------------------
+required <- c("haven","dplyr","tidyr","ggplot2","caret","pROC","e1071",
+              "xgboost","gbm","ranger","rpart","nnet","naivebayes")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop("Install missing packages: ",paste(missing,collapse=", "))
+suppressPackageStartupMessages({
+  library(haven); library(dplyr); library(tidyr); library(ggplot2); library(caret); library(pROC)
+})
+
+# ---- 2. DATA PREPARATION ----------------------------------------------------
+if (!file.exists(DATA_FILE)) stop("DATA_FILE not found: ",DATA_FILE)
+raw <- haven::read_dta(DATA_FILE)
+if (!all(c("analytic","V021","V005","residence","higher_edu") %in% names(raw)))
+  stop("Required variables missing. Check analytic, V021, V005, residence and higher_edu.")
+raw <- raw[as.integer(haven::zap_labels(raw$analytic)) == 1, , drop=FALSE]
+if (!"wt" %in% names(raw)) raw$wt <- as.numeric(raw$V005)/1e6
+
+PE_VAR <- intersect(c("partner_edu_hi","partner_edu_binary","partner_education"),names(raw))[1]
+if (is.na(PE_VAR)) stop("Partner education predictor not found.")
+PRED_ALL <- c("age_group","wealth3","residence","region","hh_size_cat",PE_VAR,"partner_occ4",
+              "marriage_timing","first_birth_timing","media_cat3","empowerment_binary","phone_type","internet3")
+# Support variable names used in earlier prepared datasets.
+aliases <- c(wealth3="wealth_index", partner_occ4="partner_occ_cat", marriage_timing="marrital_status",
+             first_birth_timing="pregnancy_time", media_cat3="media_exposure", internet3="internet_uses")
+for (nm in names(aliases)) if (!nm %in% names(raw) && aliases[[nm]] %in% names(raw)) PRED_ALL[PRED_ALL==nm] <- aliases[[nm]]
+missing_pred <- setdiff(PRED_ALL,names(raw))
+if (length(missing_pred)) stop("Predictor(s) missing from prepared dataset: ",paste(missing_pred,collapse=", "))
+
+to_factor <- function(x) {
+  z <- if (inherits(x,"haven_labelled")) haven::as_factor(x,levels="labels") else factor(x)
+  z <- droplevels(z)
+  levels(z) <- make.names(levels(z),unique=TRUE)
+  z
+}
+
+df <- raw %>% transmute(
+  V021=as.character(V021), wt=as.numeric(wt),
+  res=ifelse(as.integer(haven::zap_labels(residence))==1,"Urban","Rural"),
+  y=factor(ifelse(as.integer(haven::zap_labels(higher_edu))==1,"Yes","No"),levels=c("Yes","No")),
+  across(all_of(PRED_ALL),to_factor)
+)
+# Complete-case sample for the selected outcome and predictors.
+keep_cc <- complete.cases(df[,c("V021","y",PRED_ALL)]) & !is.na(df$wt) & df$wt>0
+df <- droplevels(df[keep_cc,,drop=FALSE])
+if (nrow(df)==0) stop("No complete observations remain after filtering.")
+if (length(unique(df$V021)) < K_FOLDS) stop("Fewer PSUs than requested CV folds.")
+
+# PSU IDs must not cross residence strata.
+psu_check <- df %>% distinct(V021,res) %>% count(V021) %>% filter(n>1)
+if (nrow(psu_check)>0) stop("At least one V021 is linked to multiple residence categories; inspect PSU IDs.")
+psu_df <- df %>% group_by(V021) %>% summarise(res=first(res),.groups="drop")
+set.seed(SEED)
+train_psus <- unlist(lapply(split(psu_df$V021,psu_df$res),function(ids) {
+  n_take <- max(1,min(length(ids)-1,round(length(ids)*TRAIN_FRAC)))
+  sample(ids,n_take)
+}),use.names=FALSE)
+train_all <- df[df$V021 %in% train_psus,,drop=FALSE]
+test_all <- df[!df$V021 %in% train_psus,,drop=FALSE]
+if (length(unique(test_all$y))<2) stop("Held-out test set contains only one outcome class.")
+write.csv(data.frame(PSU=psu_df$V021,Residence=psu_df$res,
+                     Set=ifelse(psu_df$V021 %in% train_psus,"Train","Test")),
+          file.path(OUTPUT_DIR,"PSU_train_test_assignments.csv"),row.names=FALSE)
+cat("Complete-case N:",nrow(df),"Train:",nrow(train_all),"Test:",nrow(test_all),"\n")
+
+# ---- 3. HELPERS -------------------------------------------------------------
+auc_fast <- function(y,p) {
+  ok <- is.finite(p) & !is.na(y); y<-y[ok]; p<-p[ok]
+  n1<-sum(y==1); n0<-sum(y==0)
+  if (n1==0 || n0==0) return(NA_real_)
+  r<-rank(p,ties.method="average")
+  (sum(r[y==1])-n1*(n1+1)/2)/(n1*n0)
+}
+ap_fast <- function(y,p) {
+  ok<-is.finite(p)&!is.na(y); y<-y[ok]; p<-p[ok]
+  if(sum(y==1)==0) return(NA_real_)
+  o<-order(p,decreasing=TRUE); yy<-y[o]
+  sum((cumsum(yy)/seq_along(yy))[yy==1])/sum(yy)
+}
+youden_thr <- function(y,p) {
+  r<-pROC::roc(y,p,levels=c(0,1),direction="<",quiet=TRUE)
+  as.numeric(pROC::coords(r,"best",best.method="youden",ret="threshold",transpose=FALSE)[1,1])
+}
+class_metrics <- function(y,p,thr) {
+  pr<-as.integer(p>=thr); tp<-sum(pr==1&y==1); tn<-sum(pr==0&y==0)
+  fp<-sum(pr==1&y==0); fn<-sum(pr==0&y==1)
+  se<-if(tp+fn) tp/(tp+fn) else NA_real_; sp<-if(tn+fp) tn/(tn+fp) else NA_real_
+  ppv<-if(tp+fp) tp/(tp+fp) else NA_real_; f1<-if(is.finite(ppv)&&is.finite(se)&&ppv+se>0) 2*ppv*se/(ppv+se) else NA_real_
+  data.frame(threshold=thr,Accuracy=(tp+tn)/length(y),Sensitivity=se,Specificity=sp,
+             Precision=ppv,F1=f1,Balanced_Accuracy=mean(c(se,sp),na.rm=TRUE))
+}
+calib_stats <- function(y,p) {
+  lp<-qlogis(pmin(pmax(p,1e-6),1-1e-6))
+  a<-tryCatch(coef(glm(y~1+offset(lp),family=binomial()))[1],error=function(e) NA_real_)
+  b<-tryCatch(coef(glm(y~lp,family=binomial()))[2],error=function(e) NA_real_)
+  c(Calib_intercept=unname(a),Calib_slope=unname(b))
+}
+qci <- function(x) { z<-quantile(x,c(.025,.975),na.rm=TRUE,names=FALSE); if(length(z)!=2) c(NA,NA) else z }
+
+# Greedy PSU allocator: each PSU is assigned wholly to one validation fold.
+make_group_folds <- function(data, k=5, seed=1) {
+  groups <- data %>% group_by(V021) %>% summarise(n=n(), events=sum(y=="Yes"),
+                                                  nonevents=sum(y=="No"),.groups="drop")
+  if(nrow(groups)<k) stop("Not enough unique PSUs for ",k," folds.")
+  set.seed(seed)
+  groups <- groups[sample(seq_len(nrow(groups))),]
+  groups <- groups[order(pmax(groups$events,groups$nonevents),groups$n,decreasing=TRUE),]
+  totals <- matrix(0,nrow=k,ncol=3,dimnames=list(NULL,c("n","events","nonevents")))
+  fold_ids <- vector("list",k)
+  target <- c(n=sum(groups$n)/k,events=sum(groups$events)/k,nonevents=sum(groups$nonevents)/k)
+  for(i in seq_len(nrow(groups))) {
+    g<-groups[i,]
+    if(i<=k) j<-i else {
+      scores<-vapply(seq_len(k),function(jj) {
+        tmp<-totals; tmp[jj,]<-tmp[jj,]+c(g$n,g$events,g$nonevents)
+        sum(sweep(tmp,2,target,"-")^2 / pmax(target,1))
+      },numeric(1))
+      j<-which.min(scores)
+    }
+    fold_ids[[j]]<-c(fold_ids[[j]],as.character(g$V021))
+    totals[j,]<-totals[j,]+c(g$n,g$events,g$nonevents)
+  }
+  validation <- lapply(fold_ids,function(ids) which(data$V021 %in% ids))
+  for(i in seq_along(validation)) {
+    if(length(unique(data$y[validation[[i]]]))<2)
+      stop("Fold ",i," has only one outcome class. Reduce K_FOLDS or inspect PSU-level outcome distribution.")
+    if(length(intersect(unique(data$V021[validation[[i]]]),unique(data$V021[-validation[[i]]])))>0)
+      stop("PSU leakage detected in fold ",i,".")
+  }
+  validation
+}
+
+# Cluster bootstrap resamples PSUs, retaining all observations in each sampled PSU.
+boot_cluster <- function(y,P,psu,B) {
+  ix<-split(seq_along(psu),psu); ids<-names(ix); A<-matrix(NA_real_,B,ncol(P)); R<-A
+  colnames(A)<-colnames(R)<-colnames(P)
+  for(b in seq_len(B)) {
+    chosen<-sample(ids,length(ids),replace=TRUE)
+    rows<-unlist(ix[chosen],use.names=FALSE); yy<-y[rows]
+    if(length(unique(yy))<2) next
+    for(m in seq_len(ncol(P))) { A[b,m]<-auc_fast(yy,P[rows,m]); R[b,m]<-ap_fast(yy,P[rows,m]) }
+  }
+  list(auc=A,ap=R)
+}
+
+# ---- 4. MODEL FITTING -------------------------------------------------------
+fit_caret_model <- function(mn,trm,folds) {
+  idxout<-folds; idx<-lapply(idxout,function(v)setdiff(seq_len(nrow(trm)),v))
+  ctrl<-caret::trainControl(method="cv",number=length(folds),index=idx,indexOut=idxout,
+                            classProbs=TRUE,summaryFunction=twoClassSummary,
+                            savePredictions="final",allowParallel=FALSE)
+  method_map<-c(Logistic_Regression="glm",Decision_Tree="rpart",Random_Forest="ranger",
+                Naive_Bayes="naive_bayes",Neural_Network="nnet",Gradient_Boosting="gbm")
+  args<-list(y~.,data=trm,method=unname(method_map[[mn]]),trControl=ctrl,metric="ROC")
+  if(!is.null(GRIDS[[mn]])) args$tuneGrid<-GRIDS[[mn]]
+  if(mn=="Logistic_Regression") args$family<-binomial()
+  if(mn=="Neural_Network") { args$trace<-FALSE; args$MaxNWts<-20000; args$preProcess<-c("center","scale","nzv") }
+  if(mn=="Gradient_Boosting") args$verbose<-FALSE
+  set.seed(SEED); do.call(caret::train,args)
+}
+
+fit_xgboost <- function(trm,folds,preds) {
+  encoder<-caret::dummyVars(~.,data=trm[,preds,drop=FALSE],fullRank=TRUE)
+  X<-as.matrix(data.frame(lapply(as.data.frame(predict(encoder,newdata=trm[,preds,drop=FALSE])),as.numeric)))
+  yy<-as.integer(trm$y=="Yes"); grid<-GRIDS$XGBoost
+  best_auc<--Inf; best_i<-NA_integer_; best_oof<-NULL
+  # The exact same PSU-grouped validation folds are used for tuning and OOF predictions.
+  for(i in seq_len(nrow(grid))) {
+    oof<-rep(NA_real_,nrow(trm))
+    for(f in seq_along(folds)) {
+      va<-folds[[f]]; it<-setdiff(seq_len(nrow(trm)),va)
+      dtr<-xgboost::xgb.DMatrix(X[it,,drop=FALSE],label=yy[it])
+      dva<-xgboost::xgb.DMatrix(X[va,,drop=FALSE])
+      pars<-list(objective="binary:logistic",eval_metric="auc",max_depth=grid$max_depth[i],
+                 eta=grid$eta[i],gamma=grid$gamma[i],colsample_bytree=grid$colsample_bytree[i],
+                 min_child_weight=grid$min_child_weight[i],subsample=grid$subsample[i],nthread=1)
+      set.seed(SEED+f+i)
+      mod<-xgboost::xgb.train(params=pars,data=dtr,nrounds=grid$nrounds[i],verbose=0)
+      oof[va]<-predict(mod,dva)
+    }
+    sc<-auc_fast(yy,oof)
+    if(is.finite(sc)&&sc>best_auc) {best_auc<-sc;best_i<-i;best_oof<-oof}
+  }
+  if(is.na(best_i)) stop("XGBoost tuning did not produce valid OOF predictions.")
+  pars<-list(objective="binary:logistic",eval_metric="auc",max_depth=grid$max_depth[best_i],
+             eta=grid$eta[best_i],gamma=grid$gamma[best_i],colsample_bytree=grid$colsample_bytree[best_i],
+             min_child_weight=grid$min_child_weight[best_i],subsample=grid$subsample[best_i],nthread=1)
+  dtrain<-xgboost::xgb.DMatrix(X,label=yy)
+  set.seed(SEED); final<-xgboost::xgb.train(params=pars,data=dtrain,nrounds=grid$nrounds[best_i],verbose=0)
+  list(finalModel=final,encoder=encoder,bestTune=grid[best_i,,drop=FALSE],
+       pred=data.frame(rowIndex=seq_len(nrow(trm)),obs=trm$y,Yes=best_oof,No=1-best_oof),
+       CV_AUC=best_auc,is_custom_xgb=TRUE)
+}
+
+fit_svm <- function(trm,folds,preds) {
+  yy<-trm$y; costs<-GRIDS$Radial_SVM$cost
+  best_auc<--Inf; best_cost<-NA_real_; best_oof<-NULL
+  for(cost_i in costs) {
+    oof<-rep(NA_real_,nrow(trm))
+    for(f in seq_along(folds)) {
+      va<-folds[[f]]; it<-setdiff(seq_len(nrow(trm)),va)
+      # Fit encoding and preprocessing on fold-training data only.
+      enc_f<-caret::dummyVars(~.,data=trm[it,preds,drop=FALSE],fullRank=TRUE)
+      x_it<-as.data.frame(predict(enc_f,newdata=trm[it,preds,drop=FALSE]))
+      x_va<-as.data.frame(predict(enc_f,newdata=trm[va,preds,drop=FALSE]))
+      pp_f<-caret::preProcess(x_it,method=c("center","scale","nzv"))
+      x_it<-predict(pp_f,x_it); x_va<-predict(pp_f,x_va)
+      x_va<-x_va[,names(x_it),drop=FALSE]
+      train_f<-data.frame(y=yy[it],x_it,check.names=FALSE)
+      set.seed(SEED+f)
+      mod<-e1071::svm(y~.,data=train_f,kernel="radial",cost=cost_i,probability=TRUE,scale=FALSE)
+      pr<-predict(mod,newdata=x_va,probability=TRUE)
+      probs<-attr(pr,"probabilities")
+      if(!"Yes" %in% colnames(probs)) stop("SVM did not return Yes-class probabilities in fold ",f)
+      oof[va]<-probs[,"Yes"]
+    }
+    sc<-auc_fast(as.integer(yy=="Yes"),oof)
+    if(is.finite(sc)&&sc>best_auc) {best_auc<-sc;best_cost<-cost_i;best_oof<-oof}
+  }
+  if(!is.finite(best_cost)) stop("SVM tuning did not produce valid OOF predictions.")
+  # Final encoder/preprocessor are fit on all training observations only.
+  encoder<-caret::dummyVars(~.,data=trm[,preds,drop=FALSE],fullRank=TRUE)
+  x_all<-as.data.frame(predict(encoder,newdata=trm[,preds,drop=FALSE]))
+  preproc<-caret::preProcess(x_all,method=c("center","scale","nzv"))
+  x_all<-predict(preproc,x_all)
+  final_data<-data.frame(y=yy,x_all,check.names=FALSE)
+  set.seed(SEED); final<-e1071::svm(y~.,data=final_data,kernel="radial",cost=best_cost,probability=TRUE,scale=FALSE)
+  list(finalModel=final,encoder=encoder,preproc=preproc,bestTune=data.frame(cost=best_cost),
+       pred=data.frame(rowIndex=seq_len(nrow(trm)),obs=yy,Yes=best_oof,No=1-best_oof),
+       CV_AUC=best_auc,is_custom_svm=TRUE)
+}
+
+predict_test <- function(fit,tem,preds) {
+  if(isTRUE(fit$is_custom_xgb)) {
+    xx<-as.matrix(data.frame(lapply(as.data.frame(predict(fit$encoder,newdata=tem[,preds,drop=FALSE])),as.numeric)))
+    return(as.numeric(predict(fit$finalModel,xgboost::xgb.DMatrix(xx))))
+  }
+  if(isTRUE(fit$is_custom_svm)) {
+    xx<-as.data.frame(predict(fit$encoder,newdata=tem[,preds,drop=FALSE]))
+    xx<-predict(fit$preproc,xx)
+    pr<-predict(fit$finalModel,newdata=xx,probability=TRUE)
+    return(as.numeric(attr(pr,"probabilities")[,"Yes"]))
+  }
+  as.numeric(predict(fit,newdata=tem,type="prob")[,"Yes"])
+}
+
+# ---- 5. RUN ALL STRATA ------------------------------------------------------
+perf_all<-list(); threshold_all<-list(); delong_all<-list(); roc_all<-list()
+fits_by_stratum<-list(); P_store<-list(); cv_all<-list(); selected_all<-list(); fold_assignments<-list()
+for(stratum in c("Combined","Rural","Urban")) {
+  cat("\n================ STRATUM:",stratum,"================\n")
+  predictors<-if(stratum=="Combined") PRED_ALL else setdiff(PRED_ALL,"residence")
+  use<-if(stratum=="Combined") rep(TRUE,nrow(df)) else df$res==stratum
+  full<-droplevels(df[use,,drop=FALSE])
+  tr<-full[full$V021 %in% train_psus,,drop=FALSE]
+  te<-full[!full$V021 %in% train_psus,,drop=FALSE]
+  # Keep factor levels shared across train/test; test-only categories must not become unseen levels.
+  if(nrow(tr)==0||nrow(te)==0||length(unique(te$y))<2) {cat("Skipping stratum: insufficient train/test outcome variation.\n");next}
+  trm<-tr[,c("y",predictors),drop=FALSE]; tem<-te[,c("y",predictors),drop=FALSE]
+  folds<-make_group_folds(trm %>% mutate(V021=tr$V021),k=K_FOLDS,seed=SEED+match(stratum,c("Combined","Rural","Urban")))
+  # Make sure validation folds are mutually exclusive and cover every training row exactly once.
+  if(!identical(sort(unlist(folds)),seq_len(nrow(trm)))) stop("CV folds do not partition training rows in ",stratum)
+  fold_assignment<-data.frame(Stratum=stratum,RowIndex=seq_len(nrow(trm)),PSU=tr$V021,
+                              Fold=NA_integer_)
+  for(ff in seq_along(folds)) fold_assignment$Fold[folds[[ff]]]<-ff
+  fold_assignments[[stratum]]<-fold_assignment
+  cat("Train N:",nrow(trm),"Test N:",nrow(tem),"Train PSUs:",length(unique(tr$V021)),"CV folds:",length(folds),"\n")
+
+  fits<-list(); test_predictions<-list(); oof_metrics<-list()
+  for(mn in MODELS) {
+    cat("Fitting",mn,"...\n")
+    fit<-tryCatch({
+      if(mn=="XGBoost") fit_xgboost(trm,folds,predictors)
+      else if(mn=="Radial_SVM") fit_svm(trm,folds,predictors)
+      else fit_caret_model(mn,trm,folds)
+    },error=function(e) {cat("Model failed:",mn,"|",conditionMessage(e),"\n");NULL})
+    if(is.null(fit)) next
+    pp<-tryCatch(predict_test(fit,tem,predictors),error=function(e) {cat("Test prediction failed:",mn,"|",conditionMessage(e),"\n");NULL})
+    if(is.null(pp)||length(pp)!=nrow(tem)||any(!is.finite(pp))) next
+    fits[[mn]]<-fit; test_predictions[[mn]]<-pp
+    if(isTRUE(fit$is_custom_xgb)||isTRUE(fit$is_custom_svm)) {
+      oof<-fit$pred
+      cv_auc<-fit$CV_AUC
+    } else {
+      oof<-fit$pred
+      # caret's rowIndex is the original training-row index; exactly one final-tune OOF value per row is expected.
+      oof<-oof[order(oof$rowIndex),,drop=FALSE]
+      if(anyDuplicated(oof$rowIndex)||nrow(oof)!=nrow(trm)) stop("Caret OOF predictions are incomplete/duplicated for ",mn," in ",stratum)
+      cv_auc<-auc_fast(as.integer(oof$obs=="Yes"),oof$Yes)
+    }
+    if(nrow(oof)!=nrow(trm)||anyDuplicated(oof$rowIndex)) stop("Invalid OOF prediction alignment for ",mn," in ",stratum)
+    oof_metrics[[mn]]<-list(threshold=youden_thr(as.integer(oof$obs=="Yes"),oof$Yes),
+                             CV_AUC=cv_auc,OOF_N=nrow(oof))
+    cv_all[[paste(stratum,mn,sep="_")]]<-data.frame(Stratum=stratum,Model=mn,
+      Pooled_OOF_AUC=cv_auc,OOF_N=nrow(oof),CV_method="5-fold PSU-grouped CV")
+    btune<-fit$bestTune
+    selected_all[[paste(stratum,mn,sep="_")]]<-data.frame(Stratum=stratum,Model=mn,
+      Selected_parameters=if(is.null(btune)) "None" else paste(names(btune),vapply(btune,function(x)paste(x,collapse=","),character(1)),sep=" = ",collapse="; "),
+      Pooled_OOF_AUC=cv_auc)
+  }
+  if(!REFERENCE %in% names(test_predictions)) {cat("Reference logistic model unavailable; skipping stratum outputs.\n");next}
+  P<-do.call(cbind,test_predictions); colnames(P)<-names(test_predictions)
+  y_test<-as.integer(te$y=="Yes"); P_store[[stratum]]<-list(P=P,y01=y_test,psu=te$V021)
+  fits_by_stratum[[stratum]]<-fits
+  boot<-boot_cluster(y_test,P,te$V021,N_BOOT)
+
+  perf_all[[stratum]]<-bind_rows(lapply(colnames(P),function(mn) {
+    pp<-P[,mn]; ci<-qci(boot$auc[,mn]); pci<-qci(boot$ap[,mn]); cal<-calib_stats(y_test,pp)
+    data.frame(Stratum=stratum,Model=mn,N_test=length(y_test),Prevalence_test=mean(y_test),
+      AUC=auc_fast(y_test,pp),AUC_lo=ci[1],AUC_hi=ci[2],PR_AUC=ap_fast(y_test,pp),PR_lo=pci[1],PR_hi=pci[2],
+      Brier=mean((y_test-pp)^2),Calib_intercept=cal[1],Calib_slope=cal[2])
+  }))
+  threshold_all[[stratum]]<-bind_rows(lapply(colnames(P),function(mn) {
+    thr<-oof_metrics[[mn]]$threshold
+    bind_rows(cbind(Stratum=stratum,Model=mn,Threshold_rule="Default 0.5",class_metrics(y_test,P[,mn],.5)),
+              cbind(Stratum=stratum,Model=mn,Threshold_rule="Youden from training OOF",class_metrics(y_test,P[,mn],thr)))
+  }))
+  roc_ref<-pROC::roc(y_test,P[,REFERENCE],levels=c(0,1),direction="<",quiet=TRUE)
+  others<-setdiff(colnames(P),REFERENCE)
+  if(length(others)) {
+    dl<-bind_rows(lapply(others,function(mn) {
+      rr<-pROC::roc(y_test,P[,mn],levels=c(0,1),direction="<",quiet=TRUE)
+      tt<-pROC::roc.test(roc_ref,rr,method="delong",paired=TRUE)
+      delta<-boot$auc[,REFERENCE]-boot$auc[,mn]; ci<-qci(delta)
+      data.frame(Stratum=stratum,Reference=REFERENCE,Compared=mn,AUC_ref=as.numeric(pROC::auc(roc_ref)),
+        AUC_compared=as.numeric(pROC::auc(rr)),Delta=as.numeric(pROC::auc(roc_ref))-as.numeric(pROC::auc(rr)),
+        Delta_lo=ci[1],Delta_hi=ci[2],DeLong_p=tt$p.value)
+    }))
+    dl$DeLong_p_Holm<-p.adjust(dl$DeLong_p,method="holm"); delong_all[[stratum]]<-dl
+  }
+  roc_all[[stratum]]<-bind_rows(lapply(colnames(P),function(mn) {
+    rr<-pROC::roc(y_test,P[,mn],levels=c(0,1),direction="<",quiet=TRUE)
+    data.frame(Stratum=stratum,Model=mn,FPR=1-rr$specificities,TPR=rr$sensitivities)
+  }))
+}
+
+# ---- 6. EXPORT RESULTS ------------------------------------------------------
+write_list_csv<-function(x,file) if(length(x)) write.csv(bind_rows(x),file.path(OUTPUT_DIR,file),row.names=FALSE)
+write_list_csv(perf_all,"test_performance_with_CIs.csv")
+write_list_csv(threshold_all,"threshold_metrics.csv")
+write_list_csv(delong_all,"delong_vs_logistic_regression_Holm.csv")
+write_list_csv(cv_all,"S3_selected_parameters_CV_AUC.csv")
+write_list_csv(selected_all,"selected_hyperparameters.csv")
+if(length(fold_assignments)) write.csv(bind_rows(fold_assignments),file.path(OUTPUT_DIR,"PSU_grouped_CV_fold_assignments.csv"),row.names=FALSE)
+if(length(perf_all)) {
+  test_auc_table<-bind_rows(perf_all)%>%select(Stratum,Model,AUC)%>%pivot_wider(names_from=Stratum,values_from=AUC)
+  write.csv(test_auc_table,file.path(OUTPUT_DIR,"S3_test_set_AUC.csv"),row.names=FALSE)
+}
+
+if(length(roc_all)) {
+  roc_df<-bind_rows(roc_all)%>%mutate(Stratum=factor(Stratum,levels=c("Combined","Rural","Urban")))
+  p_roc<-ggplot(roc_df,aes(FPR,TPR,colour=Model))+geom_line(linewidth=.8)+
+    geom_abline(linetype="dashed",colour="grey60")+coord_equal()+facet_wrap(~Stratum,nrow=1)+
+    scale_colour_manual(values=PAL,labels=PRETTY)+labs(x="1 - Specificity",y="Sensitivity",colour="Model")+
+    theme_classic(base_family=FONT,base_size=10)+theme(strip.background=element_blank(),
+      strip.text=element_text(face="bold"),legend.position="right")
+  ggsave(file.path(OUTPUT_DIR,"ROC_three_panel.png"),p_roc,width=8,height=4.2,dpi=600,bg="white")
+}
+
+# Save all fitted models, OOF/test predictions, and analysis objects.
+saveRDS(fits_by_stratum,file.path(OUTPUT_DIR,"fitted_models_by_stratum.rds"))
+saveRDS(P_store,file.path(OUTPUT_DIR,"test_predictions_by_stratum.rds"))
+saveRDS(list(fits=fits_by_stratum,P_store=P_store,performance=perf_all,thresholds=threshold_all,
+             delong=delong_all,cv=cv_all,selected=selected_all,folds=K_FOLDS,
+             seed=SEED,train_fraction=TRAIN_FRAC),file.path(OUTPUT_DIR,"ML_analysis_recovery.rds"))
+
+pkg_names<-c(required,"glmnet")
+pkg_versions<-data.frame(Package=pkg_names,Version=vapply(pkg_names,function(p)
+  if(requireNamespace(p,quietly=TRUE)) as.character(packageVersion(p)) else "Not installed",character(1)))
+write.csv(pkg_versions,file.path(OUTPUT_DIR,"S3_package_versions.csv"),row.names=FALSE)
+writeLines(capture.output(sessionInfo()),file.path(OUTPUT_DIR,"S3_sessionInfo.txt"))
+grid_table<-bind_rows(lapply(names(GRIDS),function(m) {
+  g<-GRIDS[[m]]
+  data.frame(Model=m,Search_grid=if(is.null(g)) "No tuning" else paste(vapply(names(g),function(v)
+    paste0(v," = ",paste(unique(g[[v]]),collapse=", ")),character(1)),collapse="; "))
+}))
+write.csv(grid_table,file.path(OUTPUT_DIR,"S3_hyperparameter_grids.csv"),row.names=FALSE)
+
+cat("\n================ PIPELINE COMPLETED ================\n")
+cat("Output folder:",OUTPUT_DIR,"\nFinished:",format(Sys.time()),"\n")
+sink()
+close(log_con)

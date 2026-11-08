@@ -1,0 +1,747 @@
+*==============================================================================
+* BDHS 2022 - WOMEN'S HIGHER EDUCATION
+* REPRODUCIBLE WORKFLOW: RAW IR DATA -> VARIABLE CONSTRUCTION -> ANALYSIS -> OUTPUTS
+*
+* HOW TO RUN
+*   1. Edit the $raw and $out paths in Section 0 below.
+*   2. Run this entire do-file from the beginning in Stata 17 or later.
+*   3. Check the log and recode-validation tables before interpreting results.
+*   4. Expected analytic N in the current workflow is approximately 18,794;
+*      this is a diagnostic expectation, not a guaranteed result.
+*
+* IMPORTANT
+*   - The raw BDHS dataset is not included in this repository.
+*   - Do not upload the restricted/raw BDHS microdata to a public GitHub repo.
+*   - Check all source-variable codes against the official BDHS 2022 codebook.
+*
+* WHAT WAS FIXED (compared with the file that gave 567 women)
+*   - partner_occ_cat: the generic ranges (1-3, 4-5, 6-9) matched almost no BDHS
+*     codes, so nearly everyone became missing and dropped out of the models.
+*     The BDHS code mapping (0/61/62, 11-14, 15-16, 21-23, 31, 41, 51-52, 96) is back.
+*   - media_exposure: now grouped (none/low/moderate/high); before it was the raw
+*     0-6 score used as a category (levels 1,2,3,4,6; level 6 predicted perfectly).
+*   - internet_uses: the 6-level coding is back (V171B 0/1/2/3 = not in month /
+*     less than weekly / weekly / almost daily); the new file reversed the
+*     frequency order and dropped past users (V171A == 2).
+*   - phone_type: owners with unknown smartphone status are counted and kept as basic phone.
+*   - first_birth_timing: early birth is any V212 < 18 (not only 12-17).
+*   - `clear all` removed (it wiped the data you had opened); duplicate-run check added.
+*   - region keeps its division names (clonevar).
+*   - CATEGORIES (exactly as you instructed):
+*       wealth        : Poor (poorest+poorer) / Middle / Rich (richer+richest)
+*       partner educ. : Higher / Non-higher
+*       partner occup.: Not working / Agri-informal / Skilled-business / Professional
+*                       ("Other" occupation is set to missing and counted in the log)
+*       internet      : Never / Past-infrequent / Regular-frequent
+*   - estimates store names shortened (the long names caused "invalid name").
+*   - graph export now uses name(); interaction tests use merged categories,
+*     with Holm adjustment for the rural-urban family.
+*   - Rural = residence 2, urban = residence 1 (DHS coding).
+*
+* STILL VERIFY IN THE CODEBOOK: V704 codes, V743A/B/D codes (is code 3
+* "respondent + other person"? is code 6 "other"?), V169C, V171A/B, V157-V159.
+*==============================================================================
+
+version 17.0
+set more off
+set linesize 120
+set maxvar 10000
+set seed 20261022
+
+*------------------------------------------------------------------------------
+* 0. OUTPUT FOLDER, LOG, SAFETY CHECKS
+*------------------------------------------------------------------------------
+global raw "D:/raw files/dataset/BDHS Data/BDHS 2022/Individual Recode/BDIR81FL.dta"
+global out "D:/Research/Women's higher education/reanalysis/output"
+
+capture mkdir "$out"
+capture log close _all
+log using "$out/BDHS2022_full_workflow.log", replace text
+
+display as text _n "========== STEP 0: LOAD AND CHECK THE RAW IR FILE =========="
+capture confirm file "$raw"
+if _rc {
+    display as error "Raw IR file not found. Update the global raw path in Section 0."
+    log close
+    exit 601
+}
+use "$raw", clear
+
+capture confirm variable V012
+if _rc {
+    display as error "The selected file does not appear to be the BDHS IR dataset."
+    log close
+    exit 111
+}
+capture confirm variable higher_edu
+if _rc == 0 {
+    display as error "The selected dataset already contains prepared variables. Select the RAW IR file."
+    log close
+    exit 110
+}
+display as result "Raw observations loaded: " _N
+
+local raw_required "V005 V012 V021 V022 V024 V025 V106 V130 V133 V136 V157 V158 V159 V169A V169C V171A V171B V190 V201 V212 V501 V502 V511 V701 V704 V743A V743B V743D"
+foreach v of local raw_required {
+    capture confirm variable `v'
+    if _rc {
+        display as error "Required raw variable `v' is not present. Check the raw file/codebook."
+        log close
+        exit 111
+    }
+}
+
+* Source codes (compare with the codebook)
+foreach v in V106 V130 V501 V502 V701 V704 V743A V743B V743D V169A V169C V171A V171B V157 V158 V159 {
+    display as text _n "Source coding check: `v'"
+    capture noisily tab `v', missing nolabel
+}
+
+*------------------------------------------------------------------------------
+* 1. CORE VARIABLES
+*------------------------------------------------------------------------------
+display as text _n "========== STEP 1: PREPARE VARIABLES =========="
+
+gen double wt = V005/1000000 if !missing(V005)
+label variable wt "DHS sampling weight (V005/1,000,000)"
+assert wt > 0 if !missing(wt)
+
+gen byte age = V012 if inrange(V012,15,49)
+label variable age "Respondent age in years"
+gen byte age_group = .
+replace age_group = 1 if inrange(age,15,19)
+replace age_group = 2 if inrange(age,20,24)
+replace age_group = 3 if inrange(age,25,29)
+replace age_group = 4 if inrange(age,30,34)
+replace age_group = 5 if inrange(age,35,39)
+replace age_group = 6 if inrange(age,40,44)
+replace age_group = 7 if inrange(age,45,49)
+label define agegrp_lbl 1 "15-19" 2 "20-24" 3 "25-29" 4 "30-34" 5 "35-39" 6 "40-44" 7 "45-49", replace
+label values age_group agegrp_lbl
+label variable age_group "Respondent age group"
+
+gen byte higher_edu = .
+replace higher_edu = 0 if inlist(V106,0,1,2)
+replace higher_edu = 1 if V106==3
+label define higher_lbl 0 "No higher education" 1 "Higher education", replace
+label values higher_edu higher_lbl
+label variable higher_edu "Higher educational attainment (V106==3)"
+
+gen byte residence = V025 if inlist(V025,1,2)
+label define residence_lbl 1 "Urban" 2 "Rural", replace
+label values residence residence_lbl
+label variable residence "Place of residence (1 urban, 2 rural)"
+
+clonevar region = V024
+label variable region "Division (V024, keeps labels)"
+
+gen byte wealth_index = V190 if inrange(V190,1,5)
+label define wealth_lbl 1 "Poorest" 2 "Poorer" 3 "Middle" 4 "Richer" 5 "Richest", replace
+label values wealth_index wealth_lbl
+label variable wealth_index "Household wealth quintile"
+
+* PRIMARY wealth: 3 groups (poor = poorest+poorer, middle, rich = richer+richest)
+gen byte wealth3 = .
+replace wealth3 = 1 if inlist(wealth_index,1,2)
+replace wealth3 = 2 if wealth_index==3
+replace wealth3 = 3 if inlist(wealth_index,4,5)
+label define w3_lbl 1 "Poor" 2 "Middle" 3 "Rich", replace
+label values wealth3 w3_lbl
+label variable wealth3 "Household wealth, 3 groups (primary)"
+
+gen int household_size = V136 if V136>=1 & V136<.
+gen byte hh_size_cat = .
+replace hh_size_cat = 1 if inrange(household_size,1,4)
+replace hh_size_cat = 2 if inrange(household_size,5,6)
+replace hh_size_cat = 3 if household_size>=7 & household_size<.
+label define hhsize_lbl 1 "Small (1-4)" 2 "Medium (5-6)" 3 "Large (7+)", replace
+label values hh_size_cat hhsize_lbl
+label variable hh_size_cat "Household size category"
+
+gen byte religion_cat = .
+replace religion_cat = 1 if V130==1
+replace religion_cat = 2 if !missing(V130) & V130!=1 & !inlist(V130,98,99)
+label define religion_lbl 1 "Muslim" 2 "Non-Muslim", replace
+label values religion_cat religion_lbl
+label variable religion_cat "Religion (not in primary model; verify V130)"
+
+*------------------------------------------------------------------------------
+* 2. PARTNER VARIABLES AND MARRIAGE TIMING
+*------------------------------------------------------------------------------
+gen byte partner_education = V701 if inrange(V701,0,3)
+label define partneredu_lbl 0 "No education" 1 "Primary" 2 "Secondary" 3 "Higher", replace
+label values partner_education partneredu_lbl
+label variable partner_education "Partner's education (4 categories)"
+
+* Sensitivity: 3 categories (none merged with primary)
+gen byte partner_edu3 = .
+replace partner_edu3 = 1 if inlist(partner_education,0,1)
+replace partner_edu3 = 2 if partner_education==2
+replace partner_edu3 = 3 if partner_education==3
+label define partneredu3_lbl 1 "No education/primary" 2 "Secondary" 3 "Higher", replace
+label values partner_edu3 partneredu3_lbl
+label variable partner_edu3 "Partner education (3 categories)"
+
+* PRIMARY: higher vs non-higher (non-higher = none, primary or secondary)
+gen byte partner_edu_hi = .
+replace partner_edu_hi = 0 if inlist(partner_education,0,1,2)
+replace partner_edu_hi = 1 if partner_education==3
+label define pedu_hi_lbl 0 "Non-higher" 1 "Higher", replace
+label values partner_edu_hi pedu_hi_lbl
+label variable partner_edu_hi "Partner education: higher vs non-higher (primary)"
+
+* Partner occupation (V704): BDHS code mapping (VERIFY against the codebook)
+gen byte partner_occ_cat = .
+replace partner_occ_cat = 1 if inlist(V704,0,61,62)
+replace partner_occ_cat = 2 if inlist(V704,11,12,13,14)
+replace partner_occ_cat = 3 if inlist(V704,15,16)
+replace partner_occ_cat = 4 if inlist(V704,21,22,23)
+replace partner_occ_cat = 5 if V704==31
+replace partner_occ_cat = 6 if inlist(V704,51,52)
+replace partner_occ_cat = 7 if V704==41
+replace partner_occ_cat = 8 if V704==96
+* 99998 (don't know) and any unmapped code stay MISSING
+label define pocc_lbl 1 "Not working/inactive" 2 "Agriculture" 3 "Livestock/home-based" 4 "Low-skilled informal labour" 5 "Skilled labour" 6 "Business" 7 "Professional" 8 "Other", replace
+label values partner_occ_cat pocc_lbl
+label variable partner_occ_cat "Partner occupation (8 groups)"
+
+display as text _n "V704 codes NOT mapped (should be only don't-know / missing):"
+tab V704 if missing(partner_occ_cat) & !missing(V704), nolabel
+
+* PRIMARY: your older 4 groups: Not working / Agri-informal / Skilled-business / Professional.
+* "Other" (V704 = 96) is set to MISSING, as in the older table; its size is printed below.
+gen byte partner_occ4 = .
+replace partner_occ4 = 1 if partner_occ_cat==1
+replace partner_occ4 = 2 if inlist(partner_occ_cat,2,3,4)
+replace partner_occ4 = 3 if inlist(partner_occ_cat,5,6)
+replace partner_occ4 = 4 if partner_occ_cat==7
+label define occ4_lbl 1 "Not working" 2 "Agri/informal" 3 "Skilled/business" 4 "Professional", replace
+label values partner_occ4 occ4_lbl
+label variable partner_occ4 "Partner occupation (older 4 groups; primary)"
+display as text _n "Women whose partner occupation is 'Other' (set missing in the 4-group version):"
+count if partner_occ_cat==8
+
+gen byte marriage_age = V511 if inrange(V511,10,49)
+gen byte marriage_timing = .
+replace marriage_timing = 0 if marriage_age<18 & !missing(marriage_age)
+replace marriage_timing = 1 if marriage_age>=18 & marriage_age<.
+label define marriage_lbl 0 "Marriage before 18" 1 "Marriage at 18+", replace
+label values marriage_timing marriage_lbl
+label variable marriage_timing "Age at first union: under 18 vs 18+"
+
+*------------------------------------------------------------------------------
+* 3. FIRST-BIRTH TIMING
+*------------------------------------------------------------------------------
+gen int children_ever_born = V201 if inrange(V201,0,20)
+label variable children_ever_born "Children ever born"
+
+gen byte first_birth_timing = .
+replace first_birth_timing = 0 if children_ever_born==0
+replace first_birth_timing = 1 if children_ever_born>0 & V212<18
+replace first_birth_timing = 2 if children_ever_born>0 & inrange(V212,18,24)
+replace first_birth_timing = 3 if children_ever_born>0 & inrange(V212,25,49)
+label define firstbirth_lbl 0 "No births" 1 "First birth before 18" 2 "First birth at 18-24" 3 "First birth at 25+", replace
+label values first_birth_timing firstbirth_lbl
+label variable first_birth_timing "Timing of first birth (includes no births)"
+
+count if children_ever_born>0 & missing(first_birth_timing)
+display as result "Mothers with missing/invalid first-birth timing (should be 0): " r(N)
+
+*------------------------------------------------------------------------------
+* 4. MEDIA EXPOSURE (score needs all three items; THEN grouped)
+*------------------------------------------------------------------------------
+foreach v in V157 V158 V159 {
+    gen byte media_`v' = .
+    replace media_`v' = 0 if `v'==0
+    replace media_`v' = 1 if `v'==1
+    replace media_`v' = 2 if inlist(`v',2,3)
+}
+egen byte media_nmiss = rowmiss(media_V157 media_V158 media_V159)
+egen byte media_score = rowtotal(media_V157 media_V158 media_V159) if media_nmiss==0
+label variable media_score "Media exposure score (0-6)"
+
+gen byte media_exposure = .
+replace media_exposure = 0 if media_score==0
+replace media_exposure = 1 if inrange(media_score,1,2)
+replace media_exposure = 2 if inrange(media_score,3,4)
+replace media_exposure = 3 if inrange(media_score,5,6)
+label define media_lbl 0 "None" 1 "Low (1-2)" 2 "Moderate (3-4)" 3 "High (5-6)", replace
+label values media_exposure media_lbl
+label variable media_exposure "Media exposure (4 levels)"
+
+gen byte media_cat3 = .
+replace media_cat3 = 0 if media_score==0
+replace media_cat3 = 1 if inrange(media_score,1,2)
+replace media_cat3 = 2 if inrange(media_score,3,6)
+label define media3_lbl 0 "None" 1 "Low (1-2)" 2 "Moderate-high (3-6)", replace
+label values media_cat3 media3_lbl
+label variable media_cat3 "Media exposure (3 levels; primary)"
+
+*------------------------------------------------------------------------------
+* 5. EMPOWERMENT
+*------------------------------------------------------------------------------
+* Participates if code 1 (alone) or 2 (with partner); codes 3-5 = does not;
+* other codes (e.g. 6, 9) -> missing. VERIFY: is code 3 "respondent + other person"?
+foreach v in V743A V743B V743D {
+    gen byte decision_`v' = .
+    replace decision_`v' = 1 if inlist(`v',1,2)
+    replace decision_`v' = 0 if inlist(`v',3,4,5)
+}
+egen byte empowerment_nmiss = rowmiss(decision_V743A decision_V743B decision_V743D)
+egen byte empowerment_score = rowtotal(decision_V743A decision_V743B decision_V743D) if empowerment_nmiss==0
+gen byte empowerment_binary = (empowerment_score>=1) if !missing(empowerment_score)
+label define empower_lbl 0 "No participation" 1 "Participates in at least one decision", replace
+label values empowerment_binary empower_lbl
+label variable empowerment_score "Decisions with participation (0-3)"
+label variable empowerment_binary "Participates in at least one decision"
+
+gen byte emp_ge2 = (empowerment_score>=2) if !missing(empowerment_score)
+gen byte emp_all = (empowerment_score==3) if !missing(empowerment_score)
+label define emp_alt_lbl 0 "No" 1 "Yes", replace
+label values emp_ge2 emp_all emp_alt_lbl
+
+*------------------------------------------------------------------------------
+* 6. PHONE AND INTERNET
+*------------------------------------------------------------------------------
+gen byte phone_type = .
+replace phone_type = 0 if V169A==0
+replace phone_type = 1 if V169A==1 & V169C==0
+replace phone_type = 2 if V169A==1 & V169C==1
+display as text _n "Phone owners with missing smartphone status (counted as basic phone):"
+count if V169A==1 & missing(V169C)
+replace phone_type = 1 if V169A==1 & missing(V169C)
+label define phone_lbl 0 "No mobile phone" 1 "Basic/non-smartphone" 2 "Smartphone", replace
+label values phone_type phone_lbl
+label variable phone_type "Mobile phone type"
+
+* V171A: 0 never, 1 used in last 12 months, 2 used before. V171B (last month):
+* 0 not at all, 1 less than weekly, 2 at least weekly, 3 almost daily. VERIFY in the tab above.
+gen byte internet_uses = .
+replace internet_uses = 0 if V171A==0
+replace internet_uses = 1 if V171A==2
+replace internet_uses = 2 if V171A==1 & V171B==0
+replace internet_uses = 3 if V171A==1 & V171B==1
+replace internet_uses = 4 if V171A==1 & V171B==2
+replace internet_uses = 5 if V171A==1 & V171B==3
+label define internet_lbl 0 "Never used" 1 "Used >12 months ago" 2 "Used past year, not past month" 3 "Less than weekly" 4 "At least weekly" 5 "Almost daily", replace
+label values internet_uses internet_lbl
+label variable internet_uses "Internet use (6 levels)"
+
+gen byte internet3 = .
+replace internet3 = 0 if internet_uses==0
+replace internet3 = 1 if inlist(internet_uses,1,2,3)
+replace internet3 = 2 if inlist(internet_uses,4,5)
+label define internet3_lbl 0 "Never" 1 "Past/infrequent" 2 "Regular/frequent", replace
+label values internet3 internet3_lbl
+label variable internet3 "Internet use (3 levels; primary)"
+
+*------------------------------------------------------------------------------
+* 7. RECODE VALIDATION
+*------------------------------------------------------------------------------
+display as text _n "========== STEP 7: RECODE VALIDATION =========="
+tab V106 higher_edu, missing
+tab V025 residence, missing
+tab V701 partner_education, missing
+tab partner_education partner_edu3, missing
+tab partner_education partner_edu_hi, missing
+tab wealth_index wealth3, missing
+tab V704 partner_occ_cat, missing
+tab partner_occ_cat partner_occ4, missing
+tab V511 marriage_timing, missing
+tab first_birth_timing, missing
+tab media_score media_exposure, missing
+tab media_exposure media_cat3, missing
+tab V743A decision_V743A, missing
+tab V169A V169C, missing
+tab V171A V171B, missing
+tab internet_uses internet3, missing
+
+assert inlist(higher_edu,0,1) if !missing(higher_edu)
+assert inlist(residence,1,2) if !missing(residence)
+assert inrange(wealth_index,1,5) if !missing(wealth_index)
+assert inlist(partner_edu3,1,2,3) if !missing(partner_edu3)
+assert inlist(partner_edu_hi,0,1) if !missing(partner_edu_hi)
+assert inlist(wealth3,1,2,3) if !missing(wealth3)
+assert inlist(marriage_timing,0,1) if !missing(marriage_timing)
+assert inlist(first_birth_timing,0,1,2,3) if !missing(first_birth_timing)
+
+*------------------------------------------------------------------------------
+* 8. MISSING-DATA AUDIT AND ANALYTIC SAMPLE
+*------------------------------------------------------------------------------
+* >>> Missing values per model variable. One variable with ~98% missing = a recode error. <<<
+local audit_vars "higher_edu age age_group wealth_index wealth3 residence region partner_education partner_edu_hi partner_occ_cat partner_occ4 marriage_timing hh_size_cat media_exposure media_cat3 empowerment_binary phone_type internet_uses internet3 first_birth_timing children_ever_born"
+display as text _n "MISSING VALUES BY MODEL VARIABLE (all women)"
+foreach v of local audit_vars {
+    quietly count if missing(`v')
+    display as text %-24s "`v'" as result %8.0f r(N) %8.1f 100*r(N)/_N "%"
+}
+
+local primaryvars "higher_edu age age_group wealth3 residence region partner_edu_hi partner_occ4 marriage_timing hh_size_cat media_cat3 empowerment_binary phone_type internet3 first_birth_timing children_ever_born wt V021 V022"
+egen byte nmiss_analytic = rowmiss(`primaryvars')
+gen byte analytic = (nmiss_analytic==0)
+label define analytic_lbl 0 "Excluded" 1 "Complete-case analytic sample", replace
+label values analytic analytic_lbl
+label variable analytic "Complete-case analytic sample flag"
+
+gen byte analytic_ge20 = (analytic==1 & age>=20) if !missing(analytic,age)
+gen byte analytic_ge25 = (analytic==1 & age>=25) if !missing(analytic,age)
+
+quietly count
+local N_raw = r(N)
+quietly count if analytic==1
+local N_analytic = r(N)
+display as result _n "Raw N = `N_raw'   Analytic N = `N_analytic' (" %5.1f 100*`N_analytic'/`N_raw' "%)"
+if `N_analytic' < 15000 {
+    display as error "WARNING: analytic sample unexpectedly small (expected about 18,794). Check the missing-value table above."
+}
+
+* Sequential exclusion flow (for the flowchart); most structural variables first
+local flow_order "partner_education partner_occ4 marriage_timing empowerment_binary first_birth_timing media_exposure phone_type internet_uses hh_size_cat age_group wealth_index residence region higher_edu"
+tempname fh
+tempfile flowtmp
+postfile `fh' str40 step long n_lost long n_remaining using `flowtmp'
+quietly count
+post `fh' ("All women in IR file") (0) (r(N))
+gen byte _keep = 1
+foreach v of local flow_order {
+    quietly count if _keep==1 & missing(`v')
+    local lost = r(N)
+    quietly replace _keep = 0 if missing(`v')
+    quietly count if _keep==1
+    post `fh' ("Missing: `v'") (`lost') (r(N))
+}
+postclose `fh'
+preserve
+use `flowtmp', clear
+list, noobs sep(0)
+export delimited using "$out/exclusion_flow.csv", replace
+restore
+drop _keep
+
+save "$out/bdhs2022_prepared_full.dta", replace
+
+*------------------------------------------------------------------------------
+* 9. SURVEY DESIGN AND SUBPOPULATIONS
+*------------------------------------------------------------------------------
+svyset V021 [pweight=wt], strata(V022) singleunit(centered)
+svyset
+
+gen byte sub_analytic = (analytic==1)
+gen byte sub_rural    = (analytic==1 & residence==2)
+gen byte sub_urban    = (analytic==1 & residence==1)
+gen byte sub_age20    = (analytic_ge20==1)
+gen byte sub_age25    = (analytic_ge25==1)
+
+display as text _n "========== SAMPLE AND OUTCOME DISTRIBUTIONS =========="
+tab analytic, missing
+tab higher_edu if analytic==1, missing
+tab residence analytic, row missing
+display as text _n "Included vs excluded (design-based)"
+foreach v in age_group residence region wealth_index higher_edu {
+    svy: tab `v' analytic, col
+}
+display as text _n "Weighted prevalence of higher education (analytic sample)"
+svy, subpop(sub_analytic): proportion higher_edu
+svy, subpop(sub_analytic): proportion higher_edu, over(residence)
+
+* Sparse-cell check: look for cells below about 10 women
+foreach v in partner_education partner_edu_hi partner_occ4 marriage_timing first_birth_timing age_group wealth_index wealth3 empowerment_binary media_cat3 internet3 {
+    display as text _n "==== `v' x higher_edu: urban (1) and rural (2) ===="
+    capture noisily bysort residence: tab `v' higher_edu if analytic==1
+}
+
+*------------------------------------------------------------------------------
+* 10. MODEL SPECIFICATIONS
+*------------------------------------------------------------------------------
+local bgA  "i.age_group i.region i.residence i.hh_size_cat"
+local bgS  "i.age_group i.region i.hh_size_cat"
+local w3   "i.wealth3"
+local soc  "i.partner_edu_hi i.partner_occ4"
+local life "i.marriage_timing i.first_birth_timing"
+local psy  "i.empowerment_binary i.media_cat3 i.phone_type i.internet3"
+
+local rhs_main "`bgA' `w3' `soc' `life' `psy'"
+local rhs_str  "`bgS' `w3' `soc' `life' `psy'"
+
+*------------------------------------------------------------------------------
+* 11. PRIMARY MODELS
+*------------------------------------------------------------------------------
+display as text _n "========== A00: COMBINED =========="
+svy, subpop(sub_analytic): logistic higher_edu `rhs_main'
+estimates store A00_main
+
+display as text _n "========== A01: RURAL (residence==2) =========="
+svy, subpop(sub_rural): logistic higher_edu `rhs_str'
+estimates store A01_rural
+
+display as text _n "========== A02: URBAN (residence==1) =========="
+svy, subpop(sub_urban): logistic higher_edu `rhs_str'
+estimates store A02_urban
+
+* Survey-adjusted goodness of fit for the main model
+quietly svy, subpop(sub_analytic): logistic higher_edu `rhs_main'
+capture noisily estat gof, group(10)
+
+*------------------------------------------------------------------------------
+* 12. SENSITIVITY: AGE RANGE AND AGE CODING
+*------------------------------------------------------------------------------
+display as text _n "========== A03: AGE 20+ =========="
+svy, subpop(sub_age20): logistic higher_edu `rhs_main'
+estimates store A03_age20
+
+display as text _n "========== A04: AGE 25+ =========="
+svy, subpop(sub_age25): logistic higher_edu `rhs_main'
+estimates store A04_age25
+
+display as text _n "========== A12: CONTINUOUS AGE =========="
+svy, subpop(sub_analytic): logistic higher_edu c.age i.region i.residence i.hh_size_cat `w3' `soc' `life' `psy'
+estimates store A12_agecont
+
+display as text _n "========== A13: QUADRATIC AGE =========="
+svy, subpop(sub_analytic): logistic higher_edu c.age##c.age i.region i.residence i.hh_size_cat `w3' `soc' `life' `psy'
+estimates store A13_agequad
+test c.age#c.age
+
+*------------------------------------------------------------------------------
+* 13. SENSITIVITY: PARTNER VARIABLES
+*------------------------------------------------------------------------------
+display as text _n "========== A05: PARTNER EDUCATION IN 4 CATEGORIES =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' i.partner_education i.partner_occ4 `life' `psy'
+estimates store A05_edu4
+
+display as text _n "========== A06: PARTNER EDUCATION IN 3 CATEGORIES =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' i.partner_edu3 i.partner_occ4 `life' `psy'
+estimates store A06_edu3
+
+display as text _n "========== A07: WITHOUT PARTNER EDUCATION =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' i.partner_occ4 `life' `psy'
+estimates store A07_noedu
+
+display as text _n "========== A08: WITHOUT PARTNER EDUCATION AND OCCUPATION =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `life' `psy'
+estimates store A08_nopartner
+
+*------------------------------------------------------------------------------
+* 14. SENSITIVITY: INDICES AND PARITY
+*------------------------------------------------------------------------------
+display as text _n "========== A09: EMPOWERMENT >= 2 =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `soc' `life' i.emp_ge2 i.media_cat3 i.phone_type i.internet3
+estimates store A09_emp2
+
+display as text _n "========== A10: EMPOWERMENT ALL THREE =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `soc' `life' i.emp_all i.media_cat3 i.phone_type i.internet3
+estimates store A10_empall
+
+display as text _n "========== A11: PARITY INSTEAD OF FIRST-BIRTH TIMING =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `soc' i.marriage_timing c.children_ever_born `psy'
+estimates store A11_parity
+
+display as text _n "========== A19: MEDIA IN 4 LEVELS =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `soc' `life' i.empowerment_binary i.media_exposure i.phone_type i.internet3
+estimates store A19_media4
+
+display as text _n "========== A20: INTERNET IN 6 LEVELS =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' `w3' `soc' `life' i.empowerment_binary i.media_cat3 i.phone_type i.internet_uses
+estimates store A20_net6
+
+display as text _n "========== A21: WEALTH IN 5 GROUPS (original quintiles) =========="
+svy, subpop(sub_analytic): logistic higher_edu `bgA' i.wealth_index `soc' `life' `psy'
+estimates store A21_wealth5
+
+*------------------------------------------------------------------------------
+* 15. INTERACTION TESTS (merged categories; Holm within the rural-urban family)
+*------------------------------------------------------------------------------
+local pool "`bgA' `w3' `soc' `life' `psy'"
+tempfile inttmp
+postfile inth long family str40 test double F double p using `inttmp'
+
+display as text _n "========== A14: RESIDENCE X WEALTH (3 groups) =========="
+svy, subpop(sub_analytic): logistic higher_edu `pool' i.residence#i.wealth3
+estimates store A14_res_wealth
+quietly testparm i.residence#i.wealth3
+display as text "Residence x wealth: F = " %6.2f r(F) "  p = " %6.4f r(p)
+post inth (1) ("residence x wealth3") (r(F)) (r(p))
+
+display as text _n "========== A15: RESIDENCE X EMPOWERMENT =========="
+svy, subpop(sub_analytic): logistic higher_edu `pool' i.residence#i.empowerment_binary
+estimates store A15_res_emp
+quietly testparm i.residence#i.empowerment_binary
+display as text "Residence x empowerment: F = " %6.2f r(F) "  p = " %6.4f r(p)
+post inth (1) ("residence x empowerment") (r(F)) (r(p))
+
+display as text _n "========== A16: RESIDENCE X PARTNER EDUCATION (higher vs non-higher) =========="
+svy, subpop(sub_analytic): logistic higher_edu `pool' i.residence#i.partner_edu_hi
+estimates store A16_res_pedu
+quietly testparm i.residence#i.partner_edu_hi
+display as text "Residence x partner education: F = " %6.2f r(F) "  p = " %6.4f r(p)
+post inth (1) ("residence x partner_edu_hi") (r(F)) (r(p))
+
+display as text _n "========== A17: RESIDENCE X MARRIAGE TIMING =========="
+svy, subpop(sub_analytic): logistic higher_edu `pool' i.residence#i.marriage_timing
+estimates store A17_res_mar
+quietly testparm i.residence#i.marriage_timing
+display as text "Residence x marriage timing: F = " %6.2f r(F) "  p = " %6.4f r(p)
+post inth (1) ("residence x marriage_timing") (r(F)) (r(p))
+
+display as text _n "========== A18: PARTNER EDUCATION X MARRIAGE TIMING =========="
+svy, subpop(sub_analytic): logistic higher_edu `pool' i.partner_edu_hi#i.marriage_timing
+estimates store A18_pedu_mar
+quietly testparm i.partner_edu_hi#i.marriage_timing
+display as text "Partner education x marriage timing: F = " %6.2f r(F) "  p = " %6.4f r(p)
+post inth (2) ("partner_edu_hi x marriage_timing") (r(F)) (r(p))
+
+postclose inth
+preserve
+use `inttmp', clear
+sort family p
+by family: gen int rank = _n
+by family: gen int m = _N
+gen double holm = min(1, (m - rank + 1)*p)
+by family: replace holm = max(holm, holm[_n-1]) if _n > 1
+format F %8.2f
+format p holm %8.4f
+display as text _n "INTERACTION TESTS (family 1 = rural-urban, Holm-adjusted within family)"
+list family test F p holm, noobs sep(0) abbrev(32)
+export delimited using "$out/interaction_tests.csv", replace
+restore
+
+*------------------------------------------------------------------------------
+* 16. ADJUSTED PREDICTED PROBABILITIES
+*------------------------------------------------------------------------------
+estimates restore A00_main
+capture noisily margins residence, predict(pr)
+capture noisily marginsplot, title("Adjusted probability of higher education by residence") name(margins_residence, replace)
+capture noisily graph export "$out/predicted_probability_residence.png", name(margins_residence) replace
+
+estimates restore A14_res_wealth
+capture noisily margins residence#wealth3, predict(pr)
+capture noisily marginsplot, title("Adjusted probability by residence and wealth") name(margins_res_wealth, replace)
+capture noisily graph export "$out/predicted_probability_residence_wealth.png", name(margins_res_wealth) replace
+
+estimates restore A18_pedu_mar
+capture noisily margins partner_edu_hi#marriage_timing, predict(pr)
+capture noisily marginsplot, title("Adjusted probability by partner education and marriage timing") name(margins_pedu_mar, replace)
+capture noisily graph export "$out/predicted_probability_partneredu_marriage.png", name(margins_pedu_mar) replace
+
+*------------------------------------------------------------------------------
+* 17. HOMOGAMY (descriptive)
+*------------------------------------------------------------------------------
+display as text _n "Women's education (rows) by partner's education (columns), weighted row %"
+svy, subpop(sub_analytic): tab V106 partner_education, row
+tab V106 partner_education if analytic==1, row
+
+*------------------------------------------------------------------------------
+* 18. COLLINEARITY (rough; use GVIF in R for the paper)
+*------------------------------------------------------------------------------
+display as text _n "========== AUXILIARY VIF (analytic sample, unweighted) =========="
+capture noisily regress higher_edu `bgA' `w3' `soc' `life' `psy' if analytic==1
+if !_rc capture noisily estat vif
+
+local cats "age_group region residence wealth3 hh_size_cat partner_edu_hi partner_occ4 marriage_timing first_birth_timing empowerment_binary media_cat3 phone_type internet3"
+display as text _n "Cramer's V between categorical predictors"
+foreach a of local cats {
+    foreach b of local cats {
+        if "`a'" < "`b'" {
+            quietly tab `a' `b' if analytic==1, V
+            display as text %-22s "`a'" %-22s "`b'" as result %7.3f r(CramersV)
+        }
+    }
+}
+
+
+*------------------------------------------------------------------------------
+* 19. BLOCK-WISE MODELS (B1-B6)
+*------------------------------------------------------------------------------
+* These models use the SAME primary complete-case analytic sample.
+* B6 excludes partner variables from the model specification, but does NOT
+* restore women excluded because of missing partner data. It is therefore a
+* same-sample comparison, not an expanded-sample analysis.
+
+display as text _n "========== BLOCK-WISE MODELS B1-B6 =========="
+
+* B1: Sociodemographic characteristics
+local rhs_B1 "i.age_group i.region i.residence"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B1'
+estimates store B1_sociodemographic
+
+* B2: Add household characteristics
+local rhs_B2 "i.age_group i.region i.residence i.wealth3 i.hh_size_cat"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B2'
+estimates store B2_household
+
+* B3: Add partner characteristics
+local rhs_B3 "i.age_group i.region i.residence i.wealth3 i.hh_size_cat i.partner_edu_hi i.partner_occ4"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B3'
+estimates store B3_partner
+
+* B4: Add marriage and first-birth timing
+local rhs_B4 "i.age_group i.region i.residence i.wealth3 i.hh_size_cat i.partner_edu_hi i.partner_occ4 i.marriage_timing i.first_birth_timing"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B4'
+estimates store B4_marriage
+
+* B5: Fully adjusted model
+local rhs_B5 "i.age_group i.region i.residence i.wealth3 i.hh_size_cat i.partner_edu_hi i.partner_occ4 i.marriage_timing i.first_birth_timing i.media_cat3 i.empowerment_binary i.phone_type i.internet3"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B5'
+estimates store B5_full
+
+* B6: Fully adjusted model excluding partner education and occupation
+local rhs_B6 "i.age_group i.region i.residence i.wealth3 i.hh_size_cat i.marriage_timing i.first_birth_timing i.media_cat3 i.empowerment_binary i.phone_type i.internet3"
+svy, subpop(sub_analytic): logistic higher_edu `rhs_B6'
+estimates store B6_no_partner
+
+display as text _n "BLOCK-WISE MODEL COMPARISON (odds ratios)"
+estimates table B1_sociodemographic B2_household B3_partner B4_marriage B5_full B6_no_partner, eform b(%9.3f) se(%9.3f) stats(N)
+
+estimates restore B1_sociodemographic
+estimates save "$out/B1_sociodemographic.ster", replace
+estimates restore B2_household
+estimates save "$out/B2_household.ster", replace
+estimates restore B3_partner
+estimates save "$out/B3_partner.ster", replace
+estimates restore B4_marriage
+estimates save "$out/B4_marriage.ster", replace
+estimates restore B5_full
+estimates save "$out/B5_full.ster", replace
+estimates restore B6_no_partner
+estimates save "$out/B6_no_partner.ster", replace
+
+*------------------------------------------------------------------------------
+* 20. EXPORT TABLES (needs estout: ssc install estout)
+*------------------------------------------------------------------------------
+capture which esttab
+if !_rc {
+    capture noisily esttab A00_main A01_rural A02_urban A03_age20 A04_age25 A05_edu4 A06_edu3 A07_noedu A08_nopartner A09_emp2 A10_empall A11_parity A12_agecont A13_agequad A19_media4 A20_net6 A21_wealth5 using "$out/regression_main_sensitivity.csv", replace eform cells("b(fmt(3)) ci(fmt(3)) p(fmt(4))") mtitles("Combined" "Rural" "Urban" "Age 20+" "Age 25+" "Partner edu 4-cat" "Partner edu 3-cat" "No partner edu" "No partner vars" "Emp >=2" "Emp all" "Parity" "Cont age" "Quad age" "Media 4" "Internet 6" "Wealth 5") label
+    capture noisily esttab A14_res_wealth A15_res_emp A16_res_pedu A17_res_mar A18_pedu_mar using "$out/regression_interactions.csv", replace eform cells("b(fmt(3)) ci(fmt(3)) p(fmt(4))") mtitles("Res x wealth" "Res x empowerment" "Res x partner edu" "Res x marriage" "Partner edu x marriage") label
+    capture noisily esttab B1_sociodemographic B2_household B3_partner B4_marriage B5_full B6_no_partner using "$out/regression_blockwise_B1_B6.csv", replace eform cells("b(fmt(3)) ci(fmt(3)) p(fmt(4))") mtitles("B1 Sociodemographic" "B2 Household" "B3 Partner" "B4 Timing" "B5 Full" "B6 No partner") label
+}
+else {
+    display as error "esttab not installed (ssc install estout). Estimates remain stored in Stata."
+}
+
+estimates restore A00_main
+estimates save "$out/A00_main_estimates.ster", replace
+estimates dir
+
+*------------------------------------------------------------------------------
+* 21. SAVE ANALYTIC FILE AND CLOSE
+*------------------------------------------------------------------------------
+if `N_analytic' >= 15000 {
+    preserve
+    keep if analytic==1
+    save "$out/bdhs2022_analytic.dta", replace
+    restore
+}
+else {
+    display as error "Analytic file NOT saved: sample too small. Fix the recodes first."
+}
+
+display as result _n "WORKFLOW FINISHED."
+display as text "Prepared dataset: $out/bdhs2022_prepared_full.dta"
+display as text "Outputs folder: $out"
+display as text "Block-wise models B1-B6 are included."
+display as text "This workflow does not run the machine-learning analysis."
+log close
+
+*==============================================================================
+* END
+*==============================================================================
